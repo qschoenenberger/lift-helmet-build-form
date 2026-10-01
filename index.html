@@ -254,6 +254,12 @@
   .status{font-size:13px;color:var(--muted);display:none;line-height:1.5;}
   .status.show{display:block;}
   .status strong{color:var(--gold);}
+  button#shareBtn{
+    display:none;background:var(--gold);color:var(--on-accent);border:none;
+    font-family:'Barlow Condensed',sans-serif;font-weight:800;text-transform:uppercase;
+    letter-spacing:.06em;font-size:17px;padding:16px 22px;border-radius:3px;cursor:pointer;
+  }
+  button#shareBtn.show{display:block;}
   .fallback{display:none;margin-top:6px;}
   .fallback.show{display:block;}
   .fallback textarea{min-height:220px;font-family:Consolas,monospace;font-size:11.5px;}
@@ -1306,6 +1312,7 @@
     <div class="submit-bar">
       <button type="submit" id="sendBtn">Send Build Sheet to cs@liftaviationusa.com</button>
       <p class="status" id="statusMsg"></p>
+      <button type="button" id="shareBtn">Share PDF &amp; Email Build Sheet</button>
       <div class="fallback" id="fallbackBox">
         <p class="hint" style="font-size:12px;color:var(--muted);">If your email app didn't open, copy the summary below and paste it into an email to <strong style="color:var(--gold)">cs@liftaviationusa.com</strong> — and don't forget to attach the PDF that downloaded.</p>
         <textarea id="fallbackText" readonly></textarea>
@@ -1787,7 +1794,7 @@ window.addEventListener('beforeprint', () => {
 window.addEventListener('afterprint', exitPrintLayout);
 
 // ---- PDF generation (visual capture of the filled-out form, always exactly 2 Letter pages) ----
-async function downloadPdf(subject){
+async function buildPdf(subject){
   const wrap = document.querySelector('.wrap');
   const submitBar = document.querySelector('.submit-bar');
   const footerEl = document.querySelector('footer');
@@ -1839,7 +1846,11 @@ async function downloadPdf(subject){
   });
 
   const safeName = subject.replace(/[^\w\-]+/g, '_').slice(0, 80);
-  doc.save(`${safeName}.pdf`);
+  return { doc, fileName: `${safeName}.pdf` };
+}
+async function downloadPdf(subject){
+  const { doc, fileName } = await buildPdf(subject);
+  doc.save(fileName);
 }
 
 // ---- Model tab switching ----
@@ -2004,6 +2015,7 @@ const statusMsg = document.getElementById('statusMsg');
 const fallbackBox = document.getElementById('fallbackBox');
 const fallbackText = document.getElementById('fallbackText');
 const copyBtn = document.getElementById('copyBtn');
+const shareBtn = document.getElementById('shareBtn');
 
 form.addEventListener('submit', async function(e){
   e.preventDefault();
@@ -2021,22 +2033,49 @@ form.addEventListener('submit', async function(e){
   statusMsg.classList.add('show');
   statusMsg.innerHTML = 'Generating PDF…';
 
-  let pdfOk = true;
+  let pdfOk = true, pdf = null;
   try {
-    await downloadPdf(subject);
+    pdf = await buildPdf(subject);
   } catch (err) {
     pdfOk = false;
     console.error('PDF generation failed:', err);
   }
 
+  fallbackText.value = `To: ${DEST_EMAIL}\nSubject: ${subject}\n\n${bodyText}`;
+  fallbackBox.classList.add('show');
+  shareBtn.classList.remove('show');
+
+  // Phones/tablets: use the native share sheet so the PDF attaches straight into Mail/Messages.
+  // Needs a fresh tap, so we show a button instead of sharing automatically.
+  if(pdf && window.matchMedia('(pointer:coarse)').matches){
+    const file = new File([pdf.doc.output('blob')], pdf.fileName, { type: 'application/pdf' });
+    if(navigator.canShare && navigator.canShare({ files: [file] })){
+      shareBtn.onclick = async () => {
+        try {
+          await navigator.share({
+            files: [file],
+            title: subject,
+            text: `To: ${DEST_EMAIL}\nSubject: ${subject}\n\n${bodyText}`,
+          });
+        } catch (err) {
+          if(err && err.name === 'AbortError') return;   // user closed the share sheet
+          pdf.doc.save(pdf.fileName);
+          window.location.href = mailtoUrl;
+        }
+      };
+      shareBtn.classList.add('show');
+      statusMsg.innerHTML = `<strong>Your build sheet is ready.</strong> Tap <strong>Share PDF &amp; Email Build Sheet</strong>, choose your Mail app, and send it to <strong>${DEST_EMAIL}</strong> (the PDF is attached automatically).`;
+      return;
+    }
+  }
+
+  // Desktop (and phones without file sharing): download the PDF, then open the email draft
+  if(pdf) pdf.doc.save(pdf.fileName);
   window.location.href = mailtoUrl;
 
   statusMsg.innerHTML = pdfOk
     ? `<strong>Almost done —</strong> a PDF copy of this build sheet just downloaded, and your email app should be opening now with the build sheet pre-filled. <strong>Drag the downloaded PDF into the email as an attachment</strong>, then hit Send to complete the order.`
     : `<strong>Almost done —</strong> your email app should be opening now with the build sheet pre-filled. PDF generation failed on this device, so use the copy-paste summary below instead of an attachment.`;
-
-  fallbackText.value = `To: ${DEST_EMAIL}\nSubject: ${subject}\n\n${bodyText}`;
-  fallbackBox.classList.add('show');
 });
 
 copyBtn.addEventListener('click', function(){
