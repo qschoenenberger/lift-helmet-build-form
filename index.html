@@ -313,6 +313,14 @@
   body.print-layout .totals-row{padding:5px 0;}
   body.print-layout .totals-row.grand{font-size:22px;padding-top:10px;}
   body.print-layout .totals-row.order-total{font-size:20px;}
+  /* keep the desktop column layout in print/PDF even when the screen is narrow */
+  body.print-layout .item-grid.cols-2{grid-template-columns:1fr 1fr;}
+  body.print-layout .item-grid.cols-3{grid-template-columns:1fr 1fr 1fr;}
+  body.print-layout .grid2{grid-template-columns:1fr 1fr;}
+  body.print-layout h1{font-size:30px;}
+  /* long labels wrap instead of running past the page edge */
+  body.print-layout .item-row{min-width:0;}
+  body.print-layout .item-label{min-width:0;overflow-wrap:anywhere;}
 
   @media(max-width:680px){
     .item-grid.cols-2, .item-grid.cols-3{grid-template-columns:1fr;}
@@ -1751,14 +1759,16 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
 const DEST_EMAIL = "cs@liftaviationusa.com";
 
 // ---- Print / PDF layout: US Letter, 2 pages ----
-// Page 1 = selected build items. Page 2 = customer info + totals.
+// Page 1 = selected build items. Page 2 = customer info + totals (always starts a new page).
 // Unselected options are hidden in the print layout (screen version is untouched).
 let printHidden = [];
-function enterPrintLayout(){
-  const panel = activePanel();
-  printHidden = [];
-  const hide = el => { el.classList.add('print-hide'); printHidden.push(el); };
-  if(panel.querySelector('.item-row input:checked')){
+
+// Applies the compact print layout + hides unselected options inside `doc`. Returns hidden elements.
+function applyPrintLayout(doc){
+  const hidden = [];
+  const hide = el => { el.classList.add('print-hide'); hidden.push(el); };
+  const panel = doc.querySelector('.model-panel.active');
+  if(panel && panel.querySelector('.item-row input:checked')){
     panel.querySelectorAll('.calc-section').forEach(sec => {
       if(!sec.querySelector('.item-row input:checked')){ hide(sec); return; }
       sec.querySelectorAll('.item-row').forEach(row => {
@@ -1774,8 +1784,10 @@ function enterPrintLayout(){
       });
     });
   }
-  document.body.classList.add('print-layout');
+  doc.body.classList.add('print-layout');
+  return hidden;
 }
+function enterPrintLayout(){ printHidden = applyPrintLayout(document); }
 function exitPrintLayout(){
   printHidden.forEach(el => el.classList.remove('print-hide'));
   printHidden = [];
@@ -1793,56 +1805,114 @@ window.addEventListener('beforeprint', () => {
 });
 window.addEventListener('afterprint', exitPrintLayout);
 
-// ---- PDF generation (visual capture of the filled-out form, always exactly 2 Letter pages) ----
-async function buildPdf(subject){
-  const wrap = document.querySelector('.wrap');
-  const submitBar = document.querySelector('.submit-bar');
-  const footerEl = document.querySelector('footer');
-  const prevSubmitDisplay = submitBar.style.display;
-  const prevFooterDisplay = footerEl.style.display;
-  submitBar.style.display = 'none';
-  footerEl.style.display = 'none';
+// Copy the live form's current state (checks, values, text) onto a cloned copy of it
+function syncFormState(srcRoot, dstRoot){
+  const src = srcRoot.querySelectorAll('input, textarea, select');
+  const dst = dstRoot.querySelectorAll('input, textarea, select');
+  src.forEach((el, i) => {
+    const d = dst[i];
+    if(!d) return;
+    if(el.type === 'checkbox' || el.type === 'radio'){
+      if(el.checked) d.setAttribute('checked', ''); else d.removeAttribute('checked');
+    } else if(el.tagName === 'TEXTAREA'){
+      d.textContent = el.value;
+    } else if(el.tagName === 'SELECT'){
+      [...d.options].forEach((o, j) => { if(j === el.selectedIndex) o.setAttribute('selected', ''); else o.removeAttribute('selected'); });
+    } else {
+      d.setAttribute('value', el.value);
+    }
+  });
+}
 
-  let canvas, splitPx;
-  enterPrintLayout();
+// Renders the form in a hidden 720px-wide frame (= 7.5in Letter printable width) so the PDF layout
+// never depends on the visitor's screen size (phone, narrow window, zoom, etc.)
+async function buildPrintFrame(){
+  const clone = document.querySelector('.wrap').cloneNode(true);
+  syncFormState(document.querySelector('.wrap'), clone);
+  const styles = [...document.querySelectorAll('head style, head link[rel=stylesheet], head link[rel=preconnect]')].map(n => n.outerHTML).join('');
+  const iframe = document.createElement('iframe');
+  iframe.setAttribute('aria-hidden', 'true');
+  iframe.style.cssText = 'position:fixed;left:-10000px;top:0;width:720px;height:1200px;border:0;';
+  iframe.srcdoc = `<!doctype html><html><head><meta charset="utf-8">${styles}</head><body>${clone.outerHTML}</body></html>`;
+  await new Promise(resolve => { iframe.onload = resolve; document.body.appendChild(iframe); });
+  const d = iframe.contentDocument;
+  applyPrintLayout(d);
+  try { await d.fonts.ready; } catch(e) {}
+  await new Promise(r => setTimeout(r, 150));
+  return iframe;
+}
+
+// ---- PDF generation: US Letter, 0.5in margins. Page 1 = build sheet, page 2 = Customer & Order Info + totals ----
+async function buildPdf(subject){
+  const CAP = 2;                                   // canvas pixels per CSS pixel
+  const iframe = await buildPrintFrame();
+  let canvas, splitPx, breaks = [];
   try {
-    const CAP = 2;
-    const split = document.querySelector('.info-section').getBoundingClientRect().top - wrap.getBoundingClientRect().top;
+    const d = iframe.contentDocument;
+    const wrap = d.querySelector('.wrap');
+    const top = wrap.getBoundingClientRect().top;
+    const info = d.querySelector('.info-section');
+    splitPx = Math.round((info.getBoundingClientRect().top - top) * CAP);
+    // Places where page 1 may break if it ever needs more than one page (tops of visible sections)
+    d.querySelectorAll('.model-panel.active .calc-section').forEach(sec => {
+      if(sec.classList.contains('print-hide')) return;
+      const y = Math.round((sec.getBoundingClientRect().top - top) * CAP);
+      if(y > 0 && y < splitPx) breaks.push(y);
+    });
+    const H = wrap.scrollHeight;
+    iframe.style.height = (H + 20) + 'px';
     canvas = await html2canvas(wrap, {
       backgroundColor: '#ffffff',
       scale: CAP,
       useCORS: true,
-      windowWidth: 1100,   // keep the desktop layout even on narrow screens
+      width: 720,
+      height: H,
+      windowWidth: 720,
+      windowHeight: H + 20,
+      scrollX: 0,
+      scrollY: 0,
     });
-    splitPx = Math.round(split * CAP);
   } finally {
-    exitPrintLayout();
-    submitBar.style.display = prevSubmitDisplay;
-    footerEl.style.display = prevFooterDisplay;
+    iframe.remove();
   }
 
-  const slice = (y, h) => {
+  const slice = (y0, y1) => {
+    const h = Math.max(y1 - y0, 1);
     const c = document.createElement('canvas');
-    c.width = canvas.width; c.height = Math.max(h, 1);
+    c.width = canvas.width; c.height = h;
     const ctx = c.getContext('2d');
     ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, c.width, c.height);
-    ctx.drawImage(canvas, 0, y, canvas.width, h, 0, 0, canvas.width, h);
+    ctx.fillRect(0, 0, c.width, h);
+    ctx.drawImage(canvas, 0, y0, canvas.width, h, 0, 0, canvas.width, h);
     return c;
   };
-  const pages = [slice(0, splitPx), slice(splitPx, canvas.height - splitPx)];
 
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ unit: 'pt', format: 'letter', compress: true });
-  const M = 36;                                   // 0.5in margins
-  const boxW = doc.internal.pageSize.getWidth() - 2*M;
-  const boxH = doc.internal.pageSize.getHeight() - 2*M;
-  // One common scale so both pages match; shrinks only if a page would overflow
-  const s = Math.min(boxW / canvas.width, boxH / pages[0].height, boxH / pages[1].height);
+  const M = 36;                                   // 0.5in margins on every side
+  const boxW = doc.internal.pageSize.getWidth() - 2*M;    // 540pt
+  const boxH = doc.internal.pageSize.getHeight() - 2*M;   // 720pt
+  const s0 = boxW / canvas.width;                 // pt per canvas px: full printable width, readable text
+  const capPx = Math.floor(boxH / s0);            // canvas px that fit on one page at that scale
+
+  // Page 1 content (normally a single page). Only if it is genuinely too long, break at a section boundary.
+  const pages = [];
+  let y = 0;
+  const MAX_SHRINK = 1.28;                        // page 1 may shrink up to ~22% (still legible) before spilling to an extra page
+  while(splitPx - y > capPx * MAX_SHRINK){
+    const cand = breaks.filter(b => b > y && b <= y + capPx);
+    const cut = cand.length ? cand[cand.length - 1] : y + capPx;
+    pages.push(slice(y, cut));
+    y = cut;
+  }
+  pages.push(slice(y, splitPx));
+  // Customer & Order Info + totals: always begins on a fresh page
+  pages.push(slice(splitPx, canvas.height));
 
   pages.forEach((c, i) => {
     if(i > 0) doc.addPage();
-    doc.addImage(c.toDataURL('image/jpeg', 0.85), 'JPEG', M, M, c.width * s, c.height * s);
+    const sc = Math.min(s0, boxH / c.height);     // shrink only if a single page would overflow
+    doc.addImage(c.toDataURL('image/jpeg', 0.85), 'JPEG', M, M, c.width * sc, c.height * sc);
   });
 
   const safeName = subject.replace(/[^\w\-]+/g, '_').slice(0, 80);
